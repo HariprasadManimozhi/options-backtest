@@ -17,29 +17,17 @@ import concurrent.futures
 import multiprocessing
 
 try:
-    from numba import jit, cuda
+    from numba import jit
     NUMBA_AVAILABLE = True
-    CUDA_AVAILABLE = cuda.is_available()
-    if CUDA_AVAILABLE:
-        print("✅ NVIDIA GPU Detected & Enabled (CUDA)")
-    else:
-        print("✅ CPU Acceleration Enabled (Numba)")
+    print("✅ CPU Acceleration Enabled (Numba)")
         
 except ImportError:
     NUMBA_AVAILABLE = False
-    CUDA_AVAILABLE = False
     print("⚠️ Acceleration Library Not Found. Using Standard CPU Mode.")
     def jit(*args, **kwargs):
         def decorator(func):
             return func
         return decorator
-    # Dummy cuda object
-    class CudaMock:
-        def jit(self, *args, **kwargs):
-             def decorator(func): return func
-             return decorator
-        def is_available(self): return False
-    cuda = CudaMock()
 
 warnings.filterwarnings('ignore')
 
@@ -414,53 +402,7 @@ def scan_trades_fast(time_mins, total_closes, index_closes, close_pes, close_ces
             
     return -1, 0
 
-if CUDA_AVAILABLE:
-    @cuda.jit
-    def scan_trades_cuda(time_mins, total_closes, index_closes, 
-                         entry_time_min, exit_time_min,
-                         stoploss_price, profit_target_price, 
-                         index_upper, index_lower, 
-                         result_arr):
-        """
-        CUDA Kernel for trade scanning.
-        Operates on single thread per block or similar, simplistic for demonstration.
-        Ideally we batch many trades, but here we accelerate the Loop over time steps.
-        """
-        # Linear thread index doesn't map perfectly to time series loop.
-        # But we can use one thread to scan the array? No, that's not parallelism.
-        # We use grid-stride loop or just parallel threads checking different indices?
-        # Parallel threads over time points:
-        # If thread i finds exit, it writes to result using atomicMin? 
-        # We need FIRST exit. AtomicMin on index is good.
-        
-        i = cuda.grid(1)
-        if i < time_mins.shape[0]:
-            t = time_mins[i]
-            
-            # Valid time range check?
-            if t > entry_time_min:
-                tc = total_closes[i]
-                ic = index_closes[i]
-                
-                reason = 0
-                if tc >= stoploss_price:
-                    reason = 1
-                elif tc <= profit_target_price:
-                    reason = 2
-                elif ic >= index_upper or ic <= index_lower:
-                    reason = 3
-                elif t >= exit_time_min:
-                    reason = 4
-                
-                if reason > 0:
-                    # Found an exit trigger at index i.
-                    # We want the SMALLEST index i across all threads.
-                    cuda.atomic.min(result_arr, 0, i)
-                    # We also need to store reason.
-                    # This is tricky with race conditions on storing reason for min index.
-                    # Simplified: Just find min index first. Then retrieving reason is trivial on CPU.
-                    
-        # result_arr[0] init to 999999 before kernel
+
 
 
 def time_to_min(t_str):
@@ -581,44 +523,7 @@ def execute_intraday_strategy(strategy_row, backtest_data, strategy_config, file
                 reason_code = 0
                 
                 # --- CUDA PATH ---
-                if CUDA_AVAILABLE and len(times_min) > 50: # Threshold overhead
-                    try:
-                        import math
-                        d_times = cuda.to_device(times_min)
-                        d_total = cuda.to_device(total_closes)
-                        d_index = cuda.to_device(index_closes)
-                        d_res = cuda.to_device(np.array([999999], dtype=np.int32))
-                        
-                        threadsperblock = 256
-                        blockspergrid = math.ceil(len(times_min) / threadsperblock)
-                        
-                        scan_trades_cuda[blockspergrid, threadsperblock](
-                            d_times, d_total, d_index, 
-                            entry_min, exit_min, 
-                            stoploss_price, profit_target_price,
-                            index_upper_limit, index_lower_limit,
-                            d_res
-                        )
-                        
-                        res_val = d_res.copy_to_host()[0]
-                        if res_val != 999999 and res_val < len(times_min):
-                            idx = res_val
-                            # Recalculate reason on CPU to avoid complex kernel atomic logic
-                            # Since we have the index, check logic is O(1)
-                            row_t = times_min[idx]
-                            row_tc = total_closes[idx]
-                            row_ic = index_closes[idx]
-                            if row_tc >= stoploss_price: reason_code = 1
-                            elif row_tc <= profit_target_price: reason_code = 2
-                            elif row_ic >= index_upper_limit or row_ic <= index_lower_limit: reason_code = 3
-                            elif row_t >= exit_min: reason_code = 4
-                            
-                    except Exception as e:
-                        print(f"CUDA Error (falling back to CPU): {e}")
-                        idx = -1 # Trigger fallback
-                
-                # --- CPU FALLBACK (If CUDA skipped or failed or unavailable) ---
-                if idx == -1 and reason_code == 0:
+                if idx == -1:
                      close_pes = monitoring_data['close_pe'].values.astype(np.float64) # Not used in scan but needed for signature
                      close_ces = monitoring_data['close_ce'].values.astype(np.float64)
                      idx, reason_code = scan_trades_fast(
@@ -865,40 +770,8 @@ def execute_interday_strategy(strategy_row, backtest_data, strategy_config, file
                 idx = -1
                 reason_code = 0
                 
-                if CUDA_AVAILABLE and len(times_min) > 50:
-                    try:
-                         import math
-                         d_times = cuda.to_device(times_min)
-                         d_total = cuda.to_device(total_closes)
-                         d_index = cuda.to_device(index_closes)
-                         d_res = cuda.to_device(np.array([999999], dtype=np.int32))
-                        
-                         threadsperblock = 256
-                         blockspergrid = math.ceil(len(times_min) / threadsperblock)
-                         
-                         scan_trades_cuda[blockspergrid, threadsperblock](
-                            d_times, d_total, d_index, 
-                            entry_min, active_exit_min, 
-                            stoploss_price, profit_target_price,
-                            index_upper_limit, index_lower_limit,
-                            d_res
-                         )
-                         res_val = d_res.copy_to_host()[0]
-                         if res_val != 999999 and res_val < len(times_min):
-                            idx = res_val
-                            # Recalculate reason
-                            row_t = times_min[idx]
-                            row_tc = total_closes[idx]
-                            row_ic = index_closes[idx]
-                            if row_tc >= stoploss_price: reason_code = 1
-                            elif row_tc <= profit_target_price: reason_code = 2
-                            elif row_ic >= index_upper_limit or row_ic <= index_lower_limit: reason_code = 3
-                            elif row_t >= active_exit_min: reason_code = 4
-                    except Exception as e:
-                         # print(f"CUDA Error: {e}") 
-                         idx = -1 
-
-                if idx == -1 and reason_code == 0:
+                # --- CPU FALLBACK (Standard Numba) ---
+                if idx == -1:
                      close_pes = full_mon['close_pe'].values.astype(np.float64)
                      close_ces = full_mon['close_ce'].values.astype(np.float64)
                      idx, reason_code = scan_trades_fast(
